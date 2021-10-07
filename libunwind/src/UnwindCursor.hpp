@@ -23,6 +23,7 @@
 #endif
 #ifdef __APPLE__
   #include <mach-o/dyld.h>
+  #include <mach/thread_act.h>
 #endif
 
 #if defined(_LIBUNWIND_SUPPORT_SEH_UNWIND)
@@ -889,7 +890,7 @@ class UnwindCursor : public AbstractUnwindCursor{
   typedef typename A::pint_t pint_t;
 public:
                       UnwindCursor(unw_context_t *context, A &as);
-                      UnwindCursor(A &as, void *threadArg);
+                      UnwindCursor(A &as, thread_t thread);
   virtual             ~UnwindCursor() {}
   virtual bool        validReg(int);
   virtual unw_word_t  getReg(int);
@@ -1226,13 +1227,31 @@ UnwindCursor<A, R>::UnwindCursor(unw_context_t *context, A &as)
 }
 
 template <typename A, typename R>
-UnwindCursor<A, R>::UnwindCursor(A &as, void *)
+UnwindCursor<A, R>::UnwindCursor(A &as, thread_t thread)
     : _addressSpace(as), _unwindInfoMissing(false), _isSignalFrame(false) {
   memset(&_info, 0, sizeof(_info));
-  // FIXME
-  // fill in _registers from thread arg
-}
 
+#if defined(__x86_64__)
+  thread_state_flavor_t thread_state_flavor = x86_THREAD_STATE64;
+  mach_msg_type_number_t thread_state_count = x86_THREAD_STATE64_COUNT;
+#elif defined(__aarch64__)
+  thread_state_flavor_t thread_state_flavor = ARM_THREAD_STATE64;
+  mach_msg_type_number_t thread_state_count = ARM_THREAD_STATE64_COUNT;
+#else
+#error Architecture not supported
+#endif
+
+  // lucky us: the layout of the various `Registers_X` classes matches whatever
+  // the mach kernel is writing here.
+
+  kern_return_t kr =
+      thread_get_state(thread, thread_state_flavor,
+                       (thread_state_t)&_registers,
+                       &thread_state_count);
+
+  // FIXME: the function is infallible
+  (void)kr;
+}
 
 template <typename A, typename R>
 bool UnwindCursor<A, R>::validReg(int regNum) {
@@ -1601,7 +1620,7 @@ bool UnwindCursor<A, R>::getInfoFromDwarfSection(pint_t pc,
 template <typename A, typename R>
 bool UnwindCursor<A, R>::getInfoFromCompactEncodingSection(pint_t pc,
                                               const UnwindInfoSections &sects) {
-  const bool log = false;
+  const bool log = true;
   if (log)
     fprintf(stderr, "getInfoFromCompactEncodingSection(pc=0x%llX, mh=0x%llX)\n",
             (uint64_t)pc, (uint64_t)sects.dso_base);
@@ -1935,6 +1954,7 @@ void UnwindCursor<A, R>::setInfoBasedOnIPRegister(bool isReturnAddress) {
   // Ask address space object to find unwind sections for this pc.
   UnwindInfoSections sects;
   if (_addressSpace.findUnwindSections(pc, sects)) {
+    fprintf(stderr, "unwind sections found :-)\n");
 #if defined(_LIBUNWIND_SUPPORT_COMPACT_UNWIND)
     // If there is a compact unwind encoding table, look there first.
     if (sects.compact_unwind_section != 0) {
@@ -1980,6 +2000,7 @@ void UnwindCursor<A, R>::setInfoBasedOnIPRegister(bool isReturnAddress) {
       return;
 #endif
   }
+  fprintf(stderr, "no unwind sections found :-(\n");
 
 #if defined(_LIBUNWIND_SUPPORT_DWARF_UNWIND)
   // There is no static unwind info for this pc. Look to see if an FDE was
@@ -2113,8 +2134,8 @@ int UnwindCursor<A, R>::step() {
   // update info based on new PC
   if (result == UNW_STEP_SUCCESS) {
     this->setInfoBasedOnIPRegister(true);
-    if (_unwindInfoMissing)
-      return UNW_STEP_END;
+    //if (_unwindInfoMissing)
+    //  return UNW_STEP_END;
   }
 
   return result;

@@ -47,6 +47,11 @@ struct EHABIIndexEntry {
 
 #ifdef __APPLE__
 
+  #include <mach-o/dyld_images.h>
+  #include <mach-o/loader.h>
+  #include <mach/mach_vm.h>
+  #include <mach/task_info.h>
+
   struct dyld_unwind_sections
   {
     const struct mach_header*   mh;
@@ -622,6 +627,312 @@ inline bool LocalAddressSpace::findFunctionName(pint_t addr, char *buf,
   (void)bufLen;
   (void)offset;
 #endif
+  return false;
+}
+
+/// RemoteAddressSpace is used as a template parameter to UnwindCursor when
+/// unwinding a thread in the another process.
+/// In theory, the other process can be a different endianness and a different
+/// pointer size which was handled by the P template parameter in the original
+/// implementation.
+/// However, we assume that we are only dealing with x64 and arm64 here, which
+/// have both the same endianness and pointer size.
+class RemoteAddressSpace {
+public:
+  RemoteAddressSpace(task_t task) : task_(task) {}
+  static void *operator new(size_t, RemoteAddressSpace *p) { return p; }
+
+  typedef uintptr_t pint_t;
+  typedef intptr_t sint_t;
+  uint8_t get8(pint_t addr) {
+    uint8_t val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+  uint16_t get16(pint_t addr) {
+    uint16_t val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+  uint32_t get32(pint_t addr) {
+    uint32_t val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+  uint64_t get64(pint_t addr) {
+    uint64_t val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+  double getDouble(pint_t addr) {
+    double val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+  v128 getVector(pint_t addr) {
+    v128 val;
+    memcpy_from_remote(&val, (void *)addr, sizeof(val));
+    return val;
+  }
+
+  uintptr_t getP(pint_t addr) {
+    return get64(addr);
+  }
+  uint64_t getRegister(pint_t addr) {
+    return get64(addr);
+  }
+
+  uint64_t getULEB128(pint_t &addr, pint_t end);
+  int64_t getSLEB128(pint_t &addr, pint_t end);
+
+  pint_t getEncodedP(pint_t &addr, pint_t end, uint8_t encoding,
+                     pint_t datarelBase = 0);
+  bool findFunctionName(pint_t addr, char *buf, size_t bufLen,
+                        unw_word_t *offset);
+  bool findUnwindSections(pint_t targetAddr, UnwindInfoSections &info);
+  bool findOtherFDE(pint_t targetAddr, pint_t &fde);
+
+private:
+  kern_return_t memcpy_from_remote(void *dest, void *src, size_t size);
+
+  task_t task_;
+};
+
+uint64_t RemoteAddressSpace::getULEB128(pint_t &addr, pint_t end) {
+  uintptr_t size = (end - addr);
+  char buf[16];
+  memcpy_from_remote(buf, (void *)addr, 16);
+  LocalAddressSpace::pint_t laddr = (LocalAddressSpace::pint_t)buf;
+  LocalAddressSpace::pint_t sladdr = laddr;
+  uint64_t result = LocalAddressSpace::getULEB128(laddr, laddr + size);
+  addr += (laddr - sladdr);
+  return result;
+}
+
+int64_t RemoteAddressSpace::getSLEB128(pint_t &addr, pint_t end) {
+  uintptr_t size = (end - addr);
+  char buf[16];
+  memcpy_from_remote(buf, (void *)addr, 16);
+  LocalAddressSpace::pint_t laddr =
+      (LocalAddressSpace::pint_t)buf;
+  LocalAddressSpace::pint_t sladdr = laddr;
+  int64_t result = LocalAddressSpace::getSLEB128(laddr, laddr + size);
+  addr += (laddr - sladdr);
+  return result;
+}
+
+kern_return_t RemoteAddressSpace::memcpy_from_remote(void *dest, void *src, size_t size) {
+  size_t read_bytes = 0;
+  kern_return_t kr = mach_vm_read_overwrite(
+      task_, (mach_vm_address_t)src, (mach_vm_size_t)size,
+      (mach_vm_address_t)dest, (mach_vm_size_t *)&read_bytes);
+  return kr;
+}
+
+RemoteAddressSpace::pint_t
+RemoteAddressSpace::getEncodedP(pint_t &addr, pint_t end, uint8_t encoding,
+                                pint_t datarelBase) {
+  pint_t startAddr = addr;
+  const uint8_t *p = (uint8_t *)addr;
+  pint_t result;
+
+  // first get value
+  switch (encoding & 0x0F) {
+  case DW_EH_PE_ptr:
+    result = getP(addr);
+    p += sizeof(pint_t);
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_uleb128:
+    result = (pint_t)getULEB128(addr, end);
+    break;
+  case DW_EH_PE_udata2:
+    result = get16(addr);
+    p += 2;
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_udata4:
+    result = get32(addr);
+    p += 4;
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_udata8:
+    result = (pint_t)get64(addr);
+    p += 8;
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_sleb128:
+    result = (pint_t)getSLEB128(addr, end);
+    break;
+  case DW_EH_PE_sdata2:
+    // Sign extend from signed 16-bit value.
+    result = (pint_t)(int16_t)get16(addr);
+    p += 2;
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_sdata4:
+    // Sign extend from signed 32-bit value.
+    result = (pint_t)(int32_t)get32(addr);
+    p += 4;
+    addr = (pint_t)p;
+    break;
+  case DW_EH_PE_sdata8:
+    result = (pint_t)get64(addr);
+    p += 8;
+    addr = (pint_t)p;
+    break;
+  default:
+    _LIBUNWIND_ABORT("unknown pointer encoding");
+  }
+
+  // then add relative offset
+  switch (encoding & 0x70) {
+  case DW_EH_PE_absptr:
+    // do nothing
+    break;
+  case DW_EH_PE_pcrel:
+    result += startAddr;
+    break;
+  case DW_EH_PE_textrel:
+    _LIBUNWIND_ABORT("DW_EH_PE_textrel pointer encoding not supported");
+    break;
+  case DW_EH_PE_datarel:
+    // DW_EH_PE_datarel is only valid in a few places, so the parameter has a
+    // default value of 0, and we abort in the event that someone calls this
+    // function with a datarelBase of 0 and DW_EH_PE_datarel encoding.
+    if (datarelBase == 0)
+      _LIBUNWIND_ABORT("DW_EH_PE_datarel is invalid with a datarelBase of 0");
+    result += datarelBase;
+    break;
+  case DW_EH_PE_funcrel:
+    _LIBUNWIND_ABORT("DW_EH_PE_funcrel pointer encoding not supported");
+    break;
+  case DW_EH_PE_aligned:
+    _LIBUNWIND_ABORT("DW_EH_PE_aligned pointer encoding not supported");
+    break;
+  default:
+    _LIBUNWIND_ABORT("unknown pointer encoding");
+    break;
+  }
+
+  if (encoding & DW_EH_PE_indirect)
+    result = getP(result);
+
+  return result;
+}
+
+inline bool RemoteAddressSpace::findUnwindSections(pint_t targetAddr,
+                                                   UnwindInfoSections &info) {
+  task_dyld_info_data_t task_dyld_info;
+  mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+  if (task_info(task_, TASK_DYLD_INFO, (task_info_t)&task_dyld_info, &count) !=
+      KERN_SUCCESS) {
+    return false;
+  }
+  if (task_dyld_info.all_image_info_format != TASK_DYLD_ALL_IMAGE_INFO_64) {
+    return false;
+  }
+
+  dyld_all_image_infos all_images_info;
+  if (memcpy_from_remote(&all_images_info,
+                         (void *)task_dyld_info.all_image_info_addr,
+                         sizeof(dyld_all_image_infos)) != KERN_SUCCESS) {
+    return false;
+  };
+
+  for (size_t i = 0; i < all_images_info.infoArrayCount; i++) {
+    dyld_image_info image;
+    if (memcpy_from_remote(&image, (void *)&all_images_info.infoArray[i],
+                           sizeof(dyld_image_info)) != KERN_SUCCESS) {
+      continue;
+    };
+
+    // image is out of range of `targetAddr`
+    if ((pint_t)image.imageLoadAddress > targetAddr) {
+      continue;
+    }
+
+    struct mach_header_64 header;
+    if (memcpy_from_remote(&header, (void *)image.imageLoadAddress,
+                           sizeof(struct mach_header_64)) != KERN_SUCCESS) {
+      continue;
+    };
+
+    fprintf(stderr, "mach header with magic %x\n", header.magic);
+
+    if (header.magic != MH_MAGIC_64) {
+      continue;
+    }
+
+    struct load_command cmd;
+    pint_t cmd_ptr =
+        (pint_t)image.imageLoadAddress + sizeof(struct mach_header_64);
+    for (size_t c = 0; c < header.ncmds; c++) {
+      if (memcpy_from_remote(&cmd, (void *)cmd_ptr, sizeof(struct load_command)) !=
+          KERN_SUCCESS) {
+        goto continue_image;
+      };
+      if (cmd.cmd == LC_SEGMENT_64) {
+        struct segment_command_64 seg;
+        if (memcpy_from_remote(&seg, (void *)cmd_ptr,
+                               sizeof(struct segment_command_64)) !=
+            KERN_SUCCESS) {
+          goto continue_image;
+        };
+
+        if (strcmp(seg.segname, "__TEXT") == 0) {
+          pint_t sect_ptr = cmd_ptr + sizeof(struct segment_command_64);
+
+          info.dso_base = (pint_t)image.imageLoadAddress;
+          pint_t slide = info.dso_base - seg.vmaddr;
+
+          // text section out of range of `targetAddr`
+          pint_t text_end = seg.vmaddr + seg.vmsize + slide;
+          fprintf(stderr,"searching for: %lx, loadAddr: %lx, text_end: %lx\n", targetAddr, info.dso_base, text_end);
+          if (text_end < targetAddr) {
+            goto continue_image;
+          }
+
+          for (size_t s = 0; s < seg.nsects; s++) {
+            struct section_64 sect;
+            if (memcpy_from_remote(
+                    &sect, (void *)(sect_ptr + s * sizeof(struct section_64)),
+                    sizeof(struct section_64)) != KERN_SUCCESS) {
+              continue;
+            };
+
+            if (strcmp(sect.sectname, "__eh_frame") == 0) {
+              info.dwarf_section = sect.addr + slide;
+              info.dwarf_section_length = sect.size;
+            } else if (strcmp(sect.sectname, "__unwind_info") == 0) {
+              info.compact_unwind_section = sect.addr + slide;
+              info.compact_unwind_section_length = sect.size;
+            }
+          }
+          return true;
+        }
+      }
+      cmd_ptr += cmd.cmdsize;
+    }
+    continue_image:;
+  }
+
+  return false;
+}
+
+bool RemoteAddressSpace::findOtherFDE(pint_t targetAddr, pint_t & fde) {
+  // TO DO: if OS has way to dynamically register FDEs, check that.
+  (void)targetAddr;
+  (void)fde;
+  return false;
+}
+
+bool RemoteAddressSpace::findFunctionName(pint_t addr, char *buf,
+                                          size_t bufLen, unw_word_t *offset) {
+  (void)addr;
+  (void)buf;
+  (void)bufLen;
+  (void)offset;
   return false;
 }
 
