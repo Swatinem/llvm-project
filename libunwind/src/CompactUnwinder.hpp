@@ -274,6 +274,8 @@ private:
   static void frameUnwind(A &addressSpace, Registers_x86_64 &registers);
   static void framelessUnwind(A &addressSpace, uint64_t returnAddressLocation,
                               Registers_x86_64 &registers);
+  static int stepSpeculatively(
+    A &addressSpace, Registers_x86_64 &registers);
   static int
       stepWithCompactEncodingRBPFrame(compact_unwind_encoding_t compactEncoding,
                                       uint64_t functionStart, A &addressSpace,
@@ -288,6 +290,8 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncoding(
     compact_unwind_encoding_t compactEncoding, uint64_t functionStart,
     A &addressSpace, Registers_x86_64 &registers) {
   switch (compactEncoding & UNWIND_X86_64_MODE_MASK) {
+  case 0:
+    return stepSpeculatively(addressSpace, registers);
   case UNWIND_X86_64_MODE_RBP_FRAME:
     return stepWithCompactEncodingRBPFrame(compactEncoding, functionStart,
                                            addressSpace, registers);
@@ -299,6 +303,16 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncoding(
                                             addressSpace, registers, true);
   }
   _LIBUNWIND_ABORT("invalid compact unwind encoding");
+}
+
+template <typename A>
+int CompactUnwinder_x86_64<A>::stepSpeculatively(
+    A &addressSpace, Registers_x86_64 &registers) {
+  uint64_t sp = registers.getSP();
+  uint64_t ip = addressSpace.get64(sp);
+  registers.setIP(ip);
+  registers.setSP(sp + 8);
+  return UNW_STEP_SUCCESS;
 }
 
 template <typename A>

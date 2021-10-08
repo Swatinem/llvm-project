@@ -858,12 +858,12 @@ inline bool RemoteAddressSpace::findUnwindSections(pint_t targetAddr,
       continue;
     };
 
-    fprintf(stderr, "mach header with magic %x\n", header.magic);
-
     if (header.magic != MH_MAGIC_64) {
       continue;
     }
 
+    // This section here is basically a remote-rewrite of `dyld_exceptions_init` from:
+    // https://opensource.apple.com/source/dyld/dyld-195.6/src/dyldExceptions.c.auto.html
     struct load_command cmd;
     pint_t cmd_ptr =
         (pint_t)image.imageLoadAddress + sizeof(struct mach_header_64);
@@ -888,7 +888,6 @@ inline bool RemoteAddressSpace::findUnwindSections(pint_t targetAddr,
 
           // text section out of range of `targetAddr`
           pint_t text_end = seg.vmaddr + seg.vmsize + slide;
-          fprintf(stderr,"searching for: %lx, loadAddr: %lx, text_end: %lx\n", targetAddr, info.dso_base, text_end);
           if (text_end < targetAddr) {
             goto continue_image;
           }
@@ -929,6 +928,12 @@ bool RemoteAddressSpace::findOtherFDE(pint_t targetAddr, pint_t & fde) {
 
 bool RemoteAddressSpace::findFunctionName(pint_t addr, char *buf,
                                           size_t bufLen, unw_word_t *offset) {
+  // TODO:
+  // This is essentially a remote re-implementation of:
+  // `dladdr` from:
+  // https://opensource.apple.com/source/dyld/dyld-852.2/src/dyldAPIs.cpp.auto.html
+  // `findClosestSymbol` from:
+  // https://opensource.apple.com/source/dyld/dyld-852.2/src/ImageLoaderMachOClassic.cpp.auto.html
   (void)addr;
   (void)buf;
   (void)bufLen;

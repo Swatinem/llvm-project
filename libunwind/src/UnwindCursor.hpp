@@ -1620,7 +1620,7 @@ bool UnwindCursor<A, R>::getInfoFromDwarfSection(pint_t pc,
 template <typename A, typename R>
 bool UnwindCursor<A, R>::getInfoFromCompactEncodingSection(pint_t pc,
                                               const UnwindInfoSections &sects) {
-  const bool log = true;
+  const bool log = false;
   if (log)
     fprintf(stderr, "getInfoFromCompactEncodingSection(pc=0x%llX, mh=0x%llX)\n",
             (uint64_t)pc, (uint64_t)sects.dso_base);
@@ -1954,7 +1954,6 @@ void UnwindCursor<A, R>::setInfoBasedOnIPRegister(bool isReturnAddress) {
   // Ask address space object to find unwind sections for this pc.
   UnwindInfoSections sects;
   if (_addressSpace.findUnwindSections(pc, sects)) {
-    fprintf(stderr, "unwind sections found :-)\n");
 #if defined(_LIBUNWIND_SUPPORT_COMPACT_UNWIND)
     // If there is a compact unwind encoding table, look there first.
     if (sects.compact_unwind_section != 0) {
@@ -1971,8 +1970,8 @@ void UnwindCursor<A, R>::setInfoBasedOnIPRegister(bool isReturnAddress) {
   #endif
         // If unwind table has entry, but entry says there is no unwind info,
         // record that we have no unwind info.
-        if (_info.format == 0)
-          _unwindInfoMissing = true;
+        //if (_info.format == 0)
+        //  _unwindInfoMissing = true;
         return;
       }
     }
@@ -2000,7 +1999,6 @@ void UnwindCursor<A, R>::setInfoBasedOnIPRegister(bool isReturnAddress) {
       return;
 #endif
   }
-  fprintf(stderr, "no unwind sections found :-(\n");
 
 #if defined(_LIBUNWIND_SUPPORT_DWARF_UNWIND)
   // There is no static unwind info for this pc. Look to see if an FDE was
@@ -2134,8 +2132,8 @@ int UnwindCursor<A, R>::step() {
   // update info based on new PC
   if (result == UNW_STEP_SUCCESS) {
     this->setInfoBasedOnIPRegister(true);
-    //if (_unwindInfoMissing)
-    //  return UNW_STEP_END;
+    if (_unwindInfoMissing)
+      return UNW_STEP_END;
   }
 
   return result;
