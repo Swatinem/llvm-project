@@ -308,10 +308,22 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncoding(
 template <typename A>
 int CompactUnwinder_x86_64<A>::stepSpeculatively(
     A &addressSpace, Registers_x86_64 &registers) {
-  uint64_t sp = registers.getSP();
-  uint64_t ip = addressSpace.get64(sp);
-  registers.setIP(ip);
-  registers.setSP(sp + 8);
+  uint64_t rsp = registers.getSP();
+  uint64_t rbp = registers.getRBP();
+  if (rsp == rbp) {
+    // In this case we assume this was a standard `push rbp, rbp = rsp`
+    // preamble, so the stack should only have the old rbp, and the return
+    // address on it. This is the case in, for example:
+    // - `libsystem_platform.dylib/_platform_bzero$VARIANT$Haswell`
+    frameUnwind(addressSpace, registers);
+  } else {
+    // Here, we assume that the function has no stack space of its own, so we
+    // assume the return address is right there at the top. This happens for
+    // for example in:
+    // - `libsystem_kernel.dylib/__psynch_cvwait`
+    // - and other functions which appear to be syscall wrappers
+    framelessUnwind(addressSpace, rsp, registers);
+  }
   return UNW_STEP_SUCCESS;
 }
 
