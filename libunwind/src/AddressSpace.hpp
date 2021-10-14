@@ -49,6 +49,7 @@ struct EHABIIndexEntry {
 
   #include <mach-o/dyld_images.h>
   #include <mach-o/loader.h>
+  #include <mach-o/nlist.h>
   #include <mach/mach_vm.h>
   #include <mach/task_info.h>
 
@@ -630,6 +631,17 @@ inline bool LocalAddressSpace::findFunctionName(pint_t addr, char *buf,
   return false;
 }
 
+struct found_mach_info {
+  struct mach_header_64 header;
+  struct segment_command_64 segment;
+  size_t ptr_after_segment;
+  size_t load_addr;
+  size_t slide;
+  size_t text_size;
+  bool header_valid;
+  bool segment_valid;
+};
+
 /// RemoteAddressSpace is used as a template parameter to UnwindCursor when
 /// unwinding a thread in the another process.
 /// In theory, the other process can be a different endianness and a different
@@ -639,7 +651,7 @@ inline bool LocalAddressSpace::findFunctionName(pint_t addr, char *buf,
 /// have both the same endianness and pointer size.
 class RemoteAddressSpace {
 public:
-  RemoteAddressSpace(task_t task) : task_(task) {}
+  RemoteAddressSpace(task_t task) : task_(task), last_found_image(found_mach_info()) {}
   static void *operator new(size_t, RemoteAddressSpace *p) { return p; }
 
   typedef uintptr_t pint_t;
@@ -695,7 +707,16 @@ public:
 private:
   kern_return_t memcpy_from_remote(void *dest, void *src, size_t size);
 
+  // Finds the mach image that contains `targetAddr`, and saves it and the
+  // corresponding `segment` in the local `last_found_image`, returning `true`
+  // on success.
+  bool findMachSegment(pint_t targetAddr, const char *segment);
+  // Similar to the above, except it assumes the `header` of `last_found_image`
+  // is valid.
+  bool findMachSegmentInImage(pint_t targetAddr, const char *segment);
+
   task_t task_;
+  found_mach_info last_found_image;
 };
 
 uint64_t RemoteAddressSpace::getULEB128(pint_t &addr, pint_t end) {
@@ -729,6 +750,8 @@ kern_return_t RemoteAddressSpace::memcpy_from_remote(void *dest, void *src, size
   return kr;
 }
 
+// we needed to copy this whole function since we can’t reuse the one from
+// `LocalAddressSpace`. :-(
 RemoteAddressSpace::pint_t
 RemoteAddressSpace::getEncodedP(pint_t &addr, pint_t end, uint8_t encoding,
                                 pint_t datarelBase) {
@@ -821,102 +844,149 @@ RemoteAddressSpace::getEncodedP(pint_t &addr, pint_t end, uint8_t encoding,
   return result;
 }
 
+bool RemoteAddressSpace::findMachSegment(pint_t targetAddr,
+                                                const char *segment) {
+  if (!last_found_image.header_valid || !(last_found_image.load_addr <= targetAddr && last_found_image.load_addr + last_found_image.text_size > targetAddr)) {
+    last_found_image.segment_valid = false;
+    // enumerate all images and find the one we are looking for.
+
+    task_dyld_info_data_t task_dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(task_, TASK_DYLD_INFO, (task_info_t)&task_dyld_info,
+                  &count) != KERN_SUCCESS) {
+      return false;
+    }
+    if (task_dyld_info.all_image_info_format != TASK_DYLD_ALL_IMAGE_INFO_64) {
+      return false;
+    }
+
+    dyld_all_image_infos all_images_info;
+    if (memcpy_from_remote(&all_images_info,
+                           (void *)task_dyld_info.all_image_info_addr,
+                           sizeof(dyld_all_image_infos)) != KERN_SUCCESS) {
+      return false;
+    };
+
+    for (size_t i = 0; i < all_images_info.infoArrayCount; i++) {
+      dyld_image_info image;
+      if (memcpy_from_remote(&image, (void *)&all_images_info.infoArray[i],
+                             sizeof(dyld_image_info)) != KERN_SUCCESS) {
+        continue;
+      };
+
+      // image is out of range of `targetAddr`
+      if ((pint_t)image.imageLoadAddress > targetAddr) {
+        continue;
+      }
+
+      if (memcpy_from_remote(&last_found_image.header,
+                             (void *)image.imageLoadAddress,
+                             sizeof(struct mach_header_64)) != KERN_SUCCESS) {
+        continue;
+      };
+
+      if (last_found_image.header.magic != MH_MAGIC_64) {
+        continue;
+      }
+
+      last_found_image.load_addr = (size_t)image.imageLoadAddress;
+      if (findMachSegmentInImage(targetAddr, "__TEXT")) {
+        last_found_image.header_valid = true;
+        break;
+      }
+    }
+  }
+
+  if (!last_found_image.header_valid) {
+    return false;
+  }
+
+  if (!last_found_image.segment_valid ||
+      strcmp(last_found_image.segment.segname, segment) != 0) {
+    // search for the segment in the image
+    if (!findMachSegmentInImage(targetAddr, segment)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RemoteAddressSpace::findMachSegmentInImage(pint_t targetAddr, const char*segment) {
+  // This section here is basically a remote-rewrite of
+  // `dyld_exceptions_init` from:
+  // https://opensource.apple.com/source/dyld/dyld-195.6/src/dyldExceptions.c.auto.html
+  struct load_command cmd;
+  pint_t cmd_ptr =
+      (pint_t)last_found_image.load_addr + sizeof(struct mach_header_64);
+  bool found_text = false;
+  bool found_searched = false;
+  for (size_t c = 0; c < last_found_image.header.ncmds; c++) {
+    if (memcpy_from_remote(&cmd, (void *)cmd_ptr,
+                           sizeof(struct load_command)) != KERN_SUCCESS) {
+      return false;
+    };
+    if (cmd.cmd == LC_SEGMENT_64) {
+      struct segment_command_64 seg;
+      if (memcpy_from_remote(&seg, (void *)cmd_ptr,
+                             sizeof(struct segment_command_64)) !=
+          KERN_SUCCESS) {
+        return false;
+      };
+
+      if (strcmp(seg.segname, "__TEXT") == 0) {
+        pint_t slide = last_found_image.load_addr - seg.vmaddr;
+
+        // text section out of range of `targetAddr`
+        pint_t text_end = seg.vmaddr + seg.vmsize + slide;
+        if (text_end < targetAddr) {
+          return false;
+        }
+        last_found_image.slide = slide;
+        last_found_image.text_size = seg.vmsize;
+        found_text = true;
+      }
+      if (strcmp(seg.segname, segment) == 0) {
+        pint_t sect_ptr = cmd_ptr + sizeof(struct segment_command_64);
+        last_found_image.segment_valid = true;
+        last_found_image.segment = seg;
+        last_found_image.ptr_after_segment = sect_ptr;
+        found_searched = true;
+      }
+      if (found_text && found_searched) {
+        return true;
+      }
+    }
+    cmd_ptr += cmd.cmdsize;
+  }
+  return false;
+}
+
 inline bool RemoteAddressSpace::findUnwindSections(pint_t targetAddr,
                                                    UnwindInfoSections &info) {
-  task_dyld_info_data_t task_dyld_info;
-  mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-  if (task_info(task_, TASK_DYLD_INFO, (task_info_t)&task_dyld_info, &count) !=
-      KERN_SUCCESS) {
-    return false;
-  }
-  if (task_dyld_info.all_image_info_format != TASK_DYLD_ALL_IMAGE_INFO_64) {
+  if (!findMachSegment(targetAddr, "__TEXT")) {
     return false;
   }
 
-  dyld_all_image_infos all_images_info;
-  if (memcpy_from_remote(&all_images_info,
-                         (void *)task_dyld_info.all_image_info_addr,
-                         sizeof(dyld_all_image_infos)) != KERN_SUCCESS) {
-    return false;
-  };
+  info.dso_base = last_found_image.load_addr;
 
-  for (size_t i = 0; i < all_images_info.infoArrayCount; i++) {
-    dyld_image_info image;
-    if (memcpy_from_remote(&image, (void *)&all_images_info.infoArray[i],
-                           sizeof(dyld_image_info)) != KERN_SUCCESS) {
+  for (size_t s = 0; s < last_found_image.segment.nsects; s++) {
+    struct section_64 sect;
+    if (memcpy_from_remote(&sect,
+                           (void *)(last_found_image.ptr_after_segment +
+                                    s * sizeof(struct section_64)),
+                           sizeof(struct section_64)) != KERN_SUCCESS) {
       continue;
     };
 
-    // image is out of range of `targetAddr`
-    if ((pint_t)image.imageLoadAddress > targetAddr) {
-      continue;
+    if (strcmp(sect.sectname, "__eh_frame") == 0) {
+      info.dwarf_section = sect.addr + last_found_image.slide;
+      info.dwarf_section_length = sect.size;
+    } else if (strcmp(sect.sectname, "__unwind_info") == 0) {
+      info.compact_unwind_section = sect.addr + last_found_image.slide;
+      info.compact_unwind_section_length = sect.size;
     }
-
-    struct mach_header_64 header;
-    if (memcpy_from_remote(&header, (void *)image.imageLoadAddress,
-                           sizeof(struct mach_header_64)) != KERN_SUCCESS) {
-      continue;
-    };
-
-    if (header.magic != MH_MAGIC_64) {
-      continue;
-    }
-
-    // This section here is basically a remote-rewrite of `dyld_exceptions_init` from:
-    // https://opensource.apple.com/source/dyld/dyld-195.6/src/dyldExceptions.c.auto.html
-    struct load_command cmd;
-    pint_t cmd_ptr =
-        (pint_t)image.imageLoadAddress + sizeof(struct mach_header_64);
-    for (size_t c = 0; c < header.ncmds; c++) {
-      if (memcpy_from_remote(&cmd, (void *)cmd_ptr, sizeof(struct load_command)) !=
-          KERN_SUCCESS) {
-        goto continue_image;
-      };
-      if (cmd.cmd == LC_SEGMENT_64) {
-        struct segment_command_64 seg;
-        if (memcpy_from_remote(&seg, (void *)cmd_ptr,
-                               sizeof(struct segment_command_64)) !=
-            KERN_SUCCESS) {
-          goto continue_image;
-        };
-
-        if (strcmp(seg.segname, "__TEXT") == 0) {
-          pint_t sect_ptr = cmd_ptr + sizeof(struct segment_command_64);
-
-          info.dso_base = (pint_t)image.imageLoadAddress;
-          pint_t slide = info.dso_base - seg.vmaddr;
-
-          // text section out of range of `targetAddr`
-          pint_t text_end = seg.vmaddr + seg.vmsize + slide;
-          if (text_end < targetAddr) {
-            goto continue_image;
-          }
-
-          for (size_t s = 0; s < seg.nsects; s++) {
-            struct section_64 sect;
-            if (memcpy_from_remote(
-                    &sect, (void *)(sect_ptr + s * sizeof(struct section_64)),
-                    sizeof(struct section_64)) != KERN_SUCCESS) {
-              continue;
-            };
-
-            if (strcmp(sect.sectname, "__eh_frame") == 0) {
-              info.dwarf_section = sect.addr + slide;
-              info.dwarf_section_length = sect.size;
-            } else if (strcmp(sect.sectname, "__unwind_info") == 0) {
-              info.compact_unwind_section = sect.addr + slide;
-              info.compact_unwind_section_length = sect.size;
-            }
-          }
-          return true;
-        }
-      }
-      cmd_ptr += cmd.cmdsize;
-    }
-    continue_image:;
   }
-
-  return false;
+  return true;
 }
 
 bool RemoteAddressSpace::findOtherFDE(pint_t targetAddr, pint_t & fde) {
@@ -928,15 +998,69 @@ bool RemoteAddressSpace::findOtherFDE(pint_t targetAddr, pint_t & fde) {
 
 bool RemoteAddressSpace::findFunctionName(pint_t addr, char *buf,
                                           size_t bufLen, unw_word_t *offset) {
-  // TODO:
-  // This is essentially a remote re-implementation of:
-  // `dladdr` from:
-  // https://opensource.apple.com/source/dyld/dyld-852.2/src/dyldAPIs.cpp.auto.html
-  // `findClosestSymbol` from:
-  // https://opensource.apple.com/source/dyld/dyld-852.2/src/ImageLoaderMachOClassic.cpp.auto.html
-  (void)addr;
-  (void)buf;
-  (void)bufLen;
+  // This is essentially a remote re-implementation of this snippet:
+  // https://gist.github.com/integeruser/b0d3ea6c4e8387d036acf6c77c0ec406
+
+  if (!findMachSegment(addr, "__TEXT")) {
+    return false;
+  }
+
+  struct load_command cmd;
+  pint_t cmd_ptr =
+      (pint_t)last_found_image.load_addr + sizeof(struct mach_header_64);
+  for (size_t c = 0; c < last_found_image.header.ncmds; c++) {
+    if (memcpy_from_remote(&cmd, (void *)cmd_ptr,
+                           sizeof(struct load_command)) != KERN_SUCCESS) {
+      return false;
+    };
+
+    if (cmd.cmd == LC_SYMTAB) {
+      struct symtab_command seg;
+      if (memcpy_from_remote(&seg, (void *)cmd_ptr,
+                             sizeof(struct symtab_command)) != KERN_SUCCESS) {
+        return false;
+      };
+
+      size_t strtab = last_found_image.load_addr + seg.stroff;
+      size_t nearest_sym = 0;
+      for (size_t s = 0; s < seg.nsyms; s++) {
+        struct nlist_64 nlist;
+        if (memcpy_from_remote(&nlist,
+                               (void *)(last_found_image.load_addr +
+                                        seg.symoff +
+                                        s * sizeof(struct nlist_64)),
+                               sizeof(struct nlist_64)) != KERN_SUCCESS) {
+          return false;
+        };
+
+        if ((nlist.n_type & N_STAB) != 0 || (nlist.n_type & N_TYPE) != N_SECT ||
+            nlist.n_un.n_strx == 0) {
+          continue;
+        }
+
+        size_t sym_addr = nlist.n_value + last_found_image.slide;
+        if (sym_addr > nearest_sym && sym_addr < addr) {
+          size_t symbol_start = strtab + nlist.n_un.n_strx;
+          size_t bytes_to_copy = strtab + seg.strsize - symbol_start;
+          if (bytes_to_copy > bufLen) {
+            bytes_to_copy = bufLen;
+          }
+          if (memcpy_from_remote(buf, (void *)(symbol_start), bytes_to_copy) !=
+              KERN_SUCCESS) {
+            return false;
+          }
+          buf[bufLen - 1] = '\0';
+          nearest_sym = sym_addr;
+        }
+      }
+      if (nearest_sym > 0) {
+        return true;
+      }
+      break;
+    }
+    cmd_ptr += cmd.cmdsize;
+  }
+
   (void)offset;
   return false;
 }
