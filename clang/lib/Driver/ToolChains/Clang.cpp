@@ -2614,6 +2614,7 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
   // LLVM flags based on the final state.
   bool HonorINFs = true;
   bool HonorNaNs = true;
+  bool ApproxFunc = false;
   // -fmath-errno is the default on some platforms, e.g. BSD-derived OSes.
   bool MathErrno = TC.IsMathErrnoDefault();
   bool AssociativeMath = false;
@@ -2718,6 +2719,8 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
     case options::OPT_fno_honor_infinities: HonorINFs = false;        break;
     case options::OPT_fhonor_nans:          HonorNaNs = true;         break;
     case options::OPT_fno_honor_nans:       HonorNaNs = false;        break;
+    case options::OPT_fapprox_func:         ApproxFunc = true;        break;
+    case options::OPT_fno_approx_func:      ApproxFunc = false;       break;
     case options::OPT_fmath_errno:          MathErrno = true;         break;
     case options::OPT_fno_math_errno:       MathErrno = false;        break;
     case options::OPT_fassociative_math:    AssociativeMath = true;   break;
@@ -2912,6 +2915,9 @@ static void RenderFloatingPointOptions(const ToolChain &TC, const Driver &D,
 
   if (!HonorNaNs)
     CmdArgs.push_back("-menable-no-nans");
+
+  if (ApproxFunc)
+    CmdArgs.push_back("-fapprox-func");
 
   if (MathErrno)
     CmdArgs.push_back("-fmath-errno");
@@ -4586,8 +4592,7 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
         options::OPT_mllvm,
     };
     for (const auto &A : Args)
-      if (llvm::find(kBitcodeOptionBlacklist, A->getOption().getID()) !=
-          std::end(kBitcodeOptionBlacklist))
+      if (llvm::is_contained(kBitcodeOptionBlacklist, A->getOption().getID()))
         D.Diag(diag::err_drv_unsupported_embed_bitcode) << A->getSpelling();
 
     // Render the CodeGen options that need to be passed.
@@ -5475,6 +5480,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   Args.AddLastArg(CmdArgs, options::OPT_fexperimental_relative_cxx_abi_vtables,
                   options::OPT_fno_experimental_relative_cxx_abi_vtables);
 
+  if (Arg *A = Args.getLastArg(options::OPT_ffuchsia_api_level_EQ))
+    A->render(Args, CmdArgs);
+
   // Handle -{std, ansi, trigraphs} -- take the last of -{std, ansi}
   // (-ansi is equivalent to -std=c89 or -std=c++98).
   //
@@ -5815,6 +5823,17 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                        options::OPT_fno_openmp_cuda_force_full_runtime,
                        /*Default=*/false))
         CmdArgs.push_back("-fopenmp-cuda-force-full-runtime");
+
+      // When in OpenMP offloading mode, forward assumptions information about
+      // thread and team counts in the device.
+      if (Args.hasFlag(options::OPT_fopenmp_assume_teams_oversubscription,
+                       options::OPT_fno_openmp_assume_teams_oversubscription,
+                       /*Default=*/false))
+        CmdArgs.push_back("-fopenmp-assume-teams-oversubscription");
+      if (Args.hasFlag(options::OPT_fopenmp_assume_threads_oversubscription,
+                       options::OPT_fno_openmp_assume_threads_oversubscription,
+                       /*Default=*/false))
+        CmdArgs.push_back("-fopenmp-assume-threads-oversubscription");
       break;
     default:
       // By default, if Clang doesn't know how to generate useful OpenMP code
@@ -7734,11 +7753,27 @@ void OffloadBundler::ConstructJob(Compilation &C, const JobAction &JA,
     Triples += Action::GetOffloadKindName(CurKind);
     Triples += '-';
     Triples += CurTC->getTriple().normalize();
-    if ((CurKind == Action::OFK_HIP || CurKind == Action::OFK_OpenMP ||
-         CurKind == Action::OFK_Cuda) &&
+    if ((CurKind == Action::OFK_HIP || CurKind == Action::OFK_Cuda) &&
         CurDep->getOffloadingArch()) {
       Triples += '-';
       Triples += CurDep->getOffloadingArch();
+    }
+
+    // TODO: Replace parsing of -march flag. Can be done by storing GPUArch
+    //       with each toolchain.
+    StringRef GPUArchName;
+    if (CurKind == Action::OFK_OpenMP) {
+      // Extract GPUArch from -march argument in TC argument list.
+      for (unsigned ArgIndex = 0; ArgIndex < TCArgs.size(); ArgIndex++) {
+        auto ArchStr = StringRef(TCArgs.getArgString(ArgIndex));
+        auto Arch = ArchStr.startswith_insensitive("-march=");
+        if (Arch) {
+          GPUArchName = ArchStr.substr(7);
+          Triples += "-";
+          break;
+        }
+      }
+      Triples += GPUArchName.str();
     }
   }
   CmdArgs.push_back(TCArgs.MakeArgString(Triples));
@@ -7813,11 +7848,26 @@ void OffloadBundler::ConstructJobMultipleOutputs(
     Triples += '-';
     Triples += Dep.DependentToolChain->getTriple().normalize();
     if ((Dep.DependentOffloadKind == Action::OFK_HIP ||
-         Dep.DependentOffloadKind == Action::OFK_OpenMP ||
          Dep.DependentOffloadKind == Action::OFK_Cuda) &&
         !Dep.DependentBoundArch.empty()) {
       Triples += '-';
       Triples += Dep.DependentBoundArch;
+    }
+    // TODO: Replace parsing of -march flag. Can be done by storing GPUArch
+    //       with each toolchain.
+    StringRef GPUArchName;
+    if (Dep.DependentOffloadKind == Action::OFK_OpenMP) {
+      // Extract GPUArch from -march argument in TC argument list.
+      for (unsigned ArgIndex = 0; ArgIndex < TCArgs.size(); ArgIndex++) {
+        StringRef ArchStr = StringRef(TCArgs.getArgString(ArgIndex));
+        auto Arch = ArchStr.startswith_insensitive("-march=");
+        if (Arch) {
+          GPUArchName = ArchStr.substr(7);
+          Triples += "-";
+          break;
+        }
+      }
+      Triples += GPUArchName.str();
     }
   }
 

@@ -444,7 +444,6 @@ void APInt::insertBits(uint64_t subBits, unsigned bitPosition, unsigned numBits)
 }
 
 APInt APInt::extractBits(unsigned numBits, unsigned bitPosition) const {
-  assert(numBits > 0 && "Can't extract zero bits");
   assert(bitPosition < BitWidth && (numBits + bitPosition) <= BitWidth &&
          "Illegal bit extraction");
 
@@ -1953,8 +1952,9 @@ APInt APInt::sdiv_ov(const APInt &RHS, bool &Overflow) const {
 APInt APInt::smul_ov(const APInt &RHS, bool &Overflow) const {
   APInt Res = *this * RHS;
 
-  if (*this != 0 && RHS != 0)
-    Overflow = Res.sdiv(RHS) != *this || Res.sdiv(*this) != RHS;
+  if (RHS != 0)
+    Overflow = Res.sdiv(RHS) != *this ||
+               (isMinSignedValue() && RHS.isAllOnes());
   else
     Overflow = false;
   return Res;

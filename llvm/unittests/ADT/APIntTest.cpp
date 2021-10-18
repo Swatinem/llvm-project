@@ -2729,9 +2729,24 @@ TEST(APIntTest, umul_ov) {
   for (unsigned Bits = 1; Bits <= 5; ++Bits)
     for (unsigned A = 0; A != 1u << Bits; ++A)
       for (unsigned B = 0; B != 1u << Bits; ++B) {
-        APInt C = APInt(Bits, A).umul_ov(APInt(Bits, B), Overflow);
-        APInt D = APInt(2 * Bits, A) * APInt(2 * Bits, B);
-        EXPECT_TRUE(D.getHiBits(Bits).isNullValue() != Overflow);
+        APInt N1 = APInt(Bits, A), N2 = APInt(Bits, B);
+        APInt Narrow = N1.umul_ov(N2, Overflow);
+        APInt Wide = N1.zext(2 * Bits) * N2.zext(2 * Bits);
+        EXPECT_EQ(Wide.trunc(Bits), Narrow);
+        EXPECT_EQ(Narrow.zext(2 * Bits) != Wide, Overflow);
+      }
+}
+
+TEST(APIntTest, smul_ov) {
+  for (unsigned Bits = 1; Bits <= 5; ++Bits)
+    for (unsigned A = 0; A != 1u << Bits; ++A)
+      for (unsigned B = 0; B != 1u << Bits; ++B) {
+        bool Overflow;
+        APInt N1 = APInt(Bits, A), N2 = APInt(Bits, B);
+        APInt Narrow = N1.smul_ov(N2, Overflow);
+        APInt Wide = N1.sext(2 * Bits) * N2.sext(2 * Bits);
+        EXPECT_EQ(Wide.trunc(Bits), Narrow);
+        EXPECT_EQ(Narrow.sext(2 * Bits) != Wide, Overflow);
       }
 }
 
@@ -2948,6 +2963,7 @@ TEST(APIntTest, ZeroWidth) {
   // Methods like getLowBitsSet work with zero bits.
   EXPECT_EQ(0U, APInt::getLowBitsSet(0, 0).getBitWidth());
   EXPECT_EQ(0U, APInt::getSplat(0, ZW).getBitWidth());
+  EXPECT_EQ(0U, APInt(4, 10).extractBits(0, 2).getBitWidth());
 
   // Logical operators.
   ZW |= ZW2;
@@ -2990,6 +3006,7 @@ TEST(APIntTest, ZeroWidth) {
   EXPECT_EQ(0U, ZW.getLoBits(0).getBitWidth());
   EXPECT_EQ(0, ZW.zext(4));
   EXPECT_EQ(0U, APInt(4, 3).trunc(0).getBitWidth());
+  EXPECT_TRUE(ZW.isAllOnes());
 
   SmallString<42> STR;
   ZW.toStringUnsigned(STR);
